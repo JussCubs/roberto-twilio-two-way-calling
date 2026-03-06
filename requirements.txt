@@ -1,0 +1,9 @@
+flask
+flask-sock
+twilio
+openai
+sounddevice
+numpy
+audioop-lts
+kokoro-onnx
+soundfile
