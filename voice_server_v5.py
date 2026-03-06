@@ -52,7 +52,7 @@ WORKSPACE          = os.path.expanduser("~/.openclaw/workspace")
 RECORDINGS_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'recordings')
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
-REALTIME_MODEL = ev.get('REALTIME_MODEL') or os.getenv('REALTIME_MODEL') or 'gpt-4o-realtime-preview'
+REALTIME_MODEL = ev.get('REALTIME_MODEL') or os.getenv('REALTIME_MODEL') or 'gpt-realtime-1.5'
 VOICE = ev.get('ROBERTO_VOICE') or os.getenv('ROBERTO_VOICE') or 'ash'
 
 if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, OPENAI_API_KEY]):
