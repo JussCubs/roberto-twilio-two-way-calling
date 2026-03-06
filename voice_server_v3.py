@@ -214,12 +214,12 @@ def incoming():
     tunnel = get_tunnel()
     ws_url = tunnel.replace("https://","wss://").replace("http://","ws://") + "/monitor/stream"
 
-    from twilio.twiml.voice_response import Connect, Stream
+    from twilio.twiml.voice_response import Start
     r = VoiceResponse()
-    # Attach media stream for live monitoring + recording
-    connect = Connect()
-    connect.stream(url=ws_url)
-    r.append(connect)
+    # Tap audio stream for live monitoring + recording (non-blocking)
+    start = Start()
+    start.stream(url=ws_url, track='both_tracks')
+    r.append(start)
     r.pause(length=1)
     g = make_gather(); ksay(g, greeting); r.append(g)
     r.redirect("/voice/reprompt")
@@ -295,31 +295,8 @@ _call_recordings = {}  # call_sid -> {wav_writer, wav_path, start_time}
 RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'recordings')
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
-import queue as _queue
-_audio_q = _queue.Queue(maxsize=200)
-
-def _audio_player():
-    stream = sd.OutputStream(samplerate=24000, channels=1, dtype='int16', blocksize=256)
-    stream.start()
-    while True:
-        try:
-            chunk = _audio_q.get(timeout=1)
-            stream.write(chunk)
-        except _queue.Empty:
-            pass
-        except Exception as e:
-            print(f"Audio player: {e}", flush=True)
-
-threading.Thread(target=_audio_player, daemon=True).start()
-
 def play_mulaw(mulaw_bytes):
-    try:
-        pcm_8k = audioop.ulaw2lin(mulaw_bytes, 2)
-        pcm_24k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, None)
-        arr = np.frombuffer(pcm_24k, dtype=np.int16).copy()
-        try: _audio_q.put_nowait(arr)
-        except _queue.Full: pass
-    except: pass
+    pass  # playback removed — record only
 
 @sock.route('/monitor/stream')
 def media_stream(ws):
@@ -355,34 +332,65 @@ def media_stream(ws):
                     rec['wav_writer'].close()
                     dur = time.time() - rec['start_time']
                     print(f"💾 Saved {rec['wav_path']} ({dur:.0f}s)", flush=True)
-                    threading.Thread(target=transcribe_call, args=(rec['wav_path'],), daemon=True).start()
+                    meta = profiles_c.get(call_sid, {})
+                    meta['purpose'] = purposes.get(call_sid, '')
+                    meta['duration_sec'] = int(dur)
+                    threading.Thread(target=transcribe_call, args=(rec['wav_path'], meta), daemon=True).start()
                 break
         except Exception as e:
             print(f"❌ Stream: {e}", flush=True)
             break
 
-def transcribe_call(wav_path):
-    print(f"📝 Transcribing {wav_path}...", flush=True)
+def transcribe_call(wav_path, call_meta=None):
+    print(f"📝 Transcribing...", flush=True)
     try:
         import openai as _openai
         oai = _openai.OpenAI(api_key=ev.get('OPENAI_API_KEY') or os.getenv('OPENAI_API_KEY'))
+
         with open(wav_path, 'rb') as f:
             transcript = oai.audio.transcriptions.create(model='whisper-1', file=f, response_format='text')
-        print(f"📝 Transcript:\n{transcript}", flush=True)
 
-        summary = oai.chat.completions.create(
+        if not transcript.strip():
+            transcript = "[No speech detected]"
+
+        print(f"📝 Transcript: {transcript[:200]}", flush=True)
+
+        callee  = (call_meta or {}).get('callee', 'unknown')
+        purpose = (call_meta or {}).get('purpose', '')
+        dur     = (call_meta or {}).get('duration_sec', 0)
+        date    = datetime.datetime.now().strftime('%Y-%m-%d')
+
+        prompt = f"""You are organizing AI phone call recordings.
+Call metadata: callee={callee}, purpose={purpose}, duration={dur}s, date={date}
+Transcript: {transcript}
+
+Return valid JSON only (no markdown):
+{{
+  "folder_name": "<{date}>-<topic-slug-max-5-words-hyphens>",
+  "summary": "bullet point summary of the call, 3-5 points"
+}}"""
+
+        resp = oai.chat.completions.create(
             model='gpt-4o-mini',
-            messages=[
-                {"role":"system","content":"Summarize this phone call in 3-5 bullet points: who was called, what was discussed, outcomes."},
-                {"role":"user","content":transcript}
-            ]
+            messages=[{"role":"user","content":prompt}],
+            response_format={"type":"json_object"}
         ).choices[0].message.content
-        print(f"\n📋 Summary:\n{summary}", flush=True)
 
-        base = wav_path.replace('.wav','')
-        open(f"{base}_transcript.txt",'w').write(transcript)
-        open(f"{base}_summary.txt",'w').write(summary)
-        print(f"✅ Saved transcript + summary", flush=True)
+        parsed = json.loads(resp)
+        folder_name = parsed.get('folder_name', f'{date}-call').replace(' ', '-')[:60]
+        summary     = parsed.get('summary', 'No summary')
+
+        # Organize into named folder
+        call_dir = os.path.join(RECORDINGS_DIR, folder_name)
+        os.makedirs(call_dir, exist_ok=True)
+        os.rename(wav_path, os.path.join(call_dir, 'recording.wav'))
+        open(os.path.join(call_dir, 'transcript.txt'), 'w').write(transcript)
+        open(os.path.join(call_dir, 'summary.txt'), 'w').write(summary)
+        open(os.path.join(call_dir, 'meta.json'), 'w').write(json.dumps(call_meta or {}, indent=2))
+
+        print(f"✅ recordings/{folder_name}/", flush=True)
+        print(f"📋 {summary}", flush=True)
+
     except Exception as e:
         print(f"❌ Transcription error: {e}", flush=True)
 
