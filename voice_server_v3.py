@@ -190,7 +190,7 @@ def respond(msg, call_sid):
 
 # ── ROUTES ───────────────────────────────────────────────────────────────────
 def make_gather(timeout=7):
-    return Gather(input="speech", action="/voice/respond", timeout=timeout, speech_timeout="1", language="en-US")
+    return Gather(input="speech", action="/voice/respond", timeout=timeout, speech_timeout="0.5", language="en-US")
 
 @app.route("/voice/incoming", methods=["POST"])
 def incoming():
@@ -219,10 +219,6 @@ def incoming():
     r.redirect("/voice/reprompt")
     return Response(str(r), mimetype="text/xml")
 
-import random as _random
-_FILLERS = ["Mm.", "Hmm.", "Yeah.", "Mm-hmm.", "Uh-huh.", "Got it.", "Okay.", "Sure.", "Right."]
-_pending_replies = {}  # sid -> mp3 bytes or None
-
 @app.route("/voice/respond", methods=["POST"])
 def voice_respond():
     sid    = request.form.get("CallSid","unknown")
@@ -237,58 +233,9 @@ def voice_respond():
         r = VoiceResponse(); ksay(r, "Later. Talk soon."); r.hangup()
         return Response(str(r), mimetype="text/xml")
 
-    # Kick off LLM + TTS in background immediately
-    _pending_replies[sid] = None
-    threading.Thread(target=_generate_reply, args=(sid, speech), daemon=True).start()
-
-    # Return filler instantly so caller hears something while we generate
-    filler = _random.choice(_FILLERS)
-    r = VoiceResponse()
-    r.say(filler, voice="Google.en-US-Journey-D")
-    r.redirect(f"/voice/ready/{sid}")
-    return Response(str(r), mimetype="text/xml")
-
-def _generate_reply(sid, speech):
     reply = respond(speech, sid)
     print(f"🤖 Roberto: '{reply}'", flush=True)
-    # Pre-generate TTS — runs in parallel while filler plays
-    try:
-        import openai as _openai
-        oai = _openai.OpenAI(api_key=ev.get('OPENAI_API_KEY') or os.getenv('OPENAI_API_KEY'))
-        audio = oai.audio.speech.create(model='tts-1', voice='onyx', input=reply, response_format='mp3')
-        token = hashlib.md5(reply.encode()).hexdigest()[:12]
-        _tts_cache[token] = (reply, 'onyx')
-        _tts_mp3_cache[token] = audio.content
-        _pending_replies[sid] = token
-        print(f"✅ TTS ready: {token}", flush=True)
-    except Exception as e:
-        print(f"❌ TTS gen: {e}", flush=True)
-        _pending_replies[sid] = f"__say__{reply}"
-
-@app.route("/voice/ready/<sid>", methods=["POST"])
-def voice_ready(sid):
-    # Poll up to 8s for the reply to be ready
-    for _ in range(40):
-        val = _pending_replies.get(sid)
-        if val is not None:
-            break
-        time.sleep(0.2)
-
-    _pending_replies.pop(sid, None)
-    r = VoiceResponse()
-    g = make_gather()
-
-    if val and val.startswith("__say__"):
-        r.say(val[7:], voice="Google.en-US-Journey-D")
-    elif val:
-        token = val
-        url = f"{get_tunnel()}/tts/{token}"
-        g.play(url)
-    else:
-        g.play(get_tunnel() + "/tts/fallback")
-        r.say("Sorry, give me one more second.", voice="Google.en-US-Journey-D")
-
-    r.append(g)
+    r = VoiceResponse(); g = make_gather(); ksay(g, reply); r.append(g)
     r.redirect("/voice/reprompt")
     return Response(str(r), mimetype="text/xml")
 
