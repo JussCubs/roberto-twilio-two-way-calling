@@ -7,8 +7,6 @@ from flask import Flask, request, Response
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Gather
 import numpy as np
-import soundfile as sf
-from kokoro_onnx import Kokoro
 
 app = Flask(__name__)
 
@@ -63,15 +61,19 @@ def wav_header(sr=24000):
     h += struct.pack('<4sI', b'data', 0xFFFFFFFF)
     return h
 
+_tts_mp3_cache = {}  # token -> mp3 bytes (pre-generated)
+
 @app.route("/tts/<token>")
 def serve_tts(token):
+    # Serve pre-generated if available
+    if token in _tts_mp3_cache:
+        return Response(_tts_mp3_cache.pop(token), mimetype='audio/mpeg', headers={'Cache-Control': 'no-store'})
     cached = _tts_cache.get(token)
     if not cached:
         return Response("Not found", status=404)
     text, voice = cached
     import openai as _openai
-    oai_key = ev.get('OPENAI_API_KEY') or os.getenv('OPENAI_API_KEY')
-    oai = _openai.OpenAI(api_key=oai_key)
+    oai = _openai.OpenAI(api_key=ev.get('OPENAI_API_KEY') or os.getenv('OPENAI_API_KEY'))
     audio = oai.audio.speech.create(model='tts-1', voice=voice, input=text, response_format='mp3')
     return Response(audio.content, mimetype='audio/mpeg', headers={'Cache-Control': 'no-store'})
 
@@ -188,7 +190,7 @@ def respond(msg, call_sid):
 
 # ── ROUTES ───────────────────────────────────────────────────────────────────
 def make_gather(timeout=7):
-    return Gather(input="speech", action="/voice/respond", timeout=timeout, speech_timeout="auto", language="en-US")
+    return Gather(input="speech", action="/voice/respond", timeout=timeout, speech_timeout="1", language="en-US")
 
 @app.route("/voice/incoming", methods=["POST"])
 def incoming():
@@ -211,37 +213,82 @@ def incoming():
         convos[sid].append({"role":"system","content":f"You called someone. Get their name first, then: {purpose}"})
         greeting = "Hey, this is Roberto. Who am I speaking with?"
 
-    tunnel = get_tunnel()
-    ws_url = tunnel.replace("https://","wss://").replace("http://","ws://") + "/monitor/stream"
-
-    from twilio.twiml.voice_response import Start
     r = VoiceResponse()
-    # Tap audio stream for live monitoring + recording (non-blocking)
-    start = Start()
-    start.stream(url=ws_url, track='both_tracks')
-    r.append(start)
     r.pause(length=1)
     g = make_gather(); ksay(g, greeting); r.append(g)
     r.redirect("/voice/reprompt")
     return Response(str(r), mimetype="text/xml")
+
+import random as _random
+_FILLERS = ["Mm.", "Hmm.", "Yeah.", "Mm-hmm.", "Uh-huh.", "Got it.", "Okay.", "Sure.", "Right."]
+_pending_replies = {}  # sid -> mp3 bytes or None
 
 @app.route("/voice/respond", methods=["POST"])
 def voice_respond():
     sid    = request.form.get("CallSid","unknown")
     speech = request.form.get("SpeechResult","").strip()
     silence_ct[sid] = 0
-    print(f"🎤 Ryan: '{speech}'", flush=True)
+    print(f"🎤 '{speech}'", flush=True)
 
     if not speech:
         r = VoiceResponse(); r.redirect("/voice/reprompt"); return Response(str(r), mimetype="text/xml")
 
     if any(w in speech.lower() for w in ["bye","goodbye","hang up","gotta go","later","talk later"]):
-        r = VoiceResponse(); ksay(r, "Later. I'll keep things running."); r.hangup()
+        r = VoiceResponse(); ksay(r, "Later. Talk soon."); r.hangup()
         return Response(str(r), mimetype="text/xml")
 
+    # Kick off LLM + TTS in background immediately
+    _pending_replies[sid] = None
+    threading.Thread(target=_generate_reply, args=(sid, speech), daemon=True).start()
+
+    # Return filler instantly so caller hears something while we generate
+    filler = _random.choice(_FILLERS)
+    r = VoiceResponse()
+    r.say(filler, voice="Google.en-US-Journey-D")
+    r.redirect(f"/voice/ready/{sid}")
+    return Response(str(r), mimetype="text/xml")
+
+def _generate_reply(sid, speech):
     reply = respond(speech, sid)
     print(f"🤖 Roberto: '{reply}'", flush=True)
-    r = VoiceResponse(); g = make_gather(); ksay(g, reply); r.append(g)
+    # Pre-generate TTS — runs in parallel while filler plays
+    try:
+        import openai as _openai
+        oai = _openai.OpenAI(api_key=ev.get('OPENAI_API_KEY') or os.getenv('OPENAI_API_KEY'))
+        audio = oai.audio.speech.create(model='tts-1', voice='onyx', input=reply, response_format='mp3')
+        token = hashlib.md5(reply.encode()).hexdigest()[:12]
+        _tts_cache[token] = (reply, 'onyx')
+        _tts_mp3_cache[token] = audio.content
+        _pending_replies[sid] = token
+        print(f"✅ TTS ready: {token}", flush=True)
+    except Exception as e:
+        print(f"❌ TTS gen: {e}", flush=True)
+        _pending_replies[sid] = f"__say__{reply}"
+
+@app.route("/voice/ready/<sid>", methods=["POST"])
+def voice_ready(sid):
+    # Poll up to 8s for the reply to be ready
+    for _ in range(40):
+        val = _pending_replies.get(sid)
+        if val is not None:
+            break
+        time.sleep(0.2)
+
+    _pending_replies.pop(sid, None)
+    r = VoiceResponse()
+    g = make_gather()
+
+    if val and val.startswith("__say__"):
+        r.say(val[7:], voice="Google.en-US-Journey-D")
+    elif val:
+        token = val
+        url = f"{get_tunnel()}/tts/{token}"
+        g.play(url)
+    else:
+        g.play(get_tunnel() + "/tts/fallback")
+        r.say("Sorry, give me one more second.", voice="Google.en-US-Journey-D")
+
+    r.append(g)
     r.redirect("/voice/reprompt")
     return Response(str(r), mimetype="text/xml")
 
@@ -281,8 +328,37 @@ def status():
     s, sid = request.form.get("CallStatus",""), request.form.get("CallSid","")
     if s in ("completed","failed","busy","no-answer"):
         print(f"📞 {s}", flush=True)
+        meta = {**profiles_c.get(sid,{}), 'purpose': purposes.get(sid,''), 'call_sid': sid}
         for d in [convos,deep_q,deep_busy,silence_ct,purposes,profiles_c]: d.pop(sid,None)
+        if s == "completed":
+            threading.Thread(target=fetch_and_process_recording, args=(sid, meta), daemon=True).start()
     return Response("OK")
+
+def fetch_and_process_recording(call_sid, meta):
+    """Download Twilio's native recording (high quality) after call ends."""
+    import time as _time
+    _time.sleep(5)  # give Twilio a moment to finalize
+    try:
+        recordings = client.recordings.list(call_sid=call_sid, limit=1)
+        if not recordings:
+            print(f"⚠️ No Twilio recording found for {call_sid}", flush=True)
+            return
+        rec = recordings[0]
+        # Download as WAV (8kHz stereo from Twilio — much cleaner than our WebSocket capture)
+        url = f"https://api.twilio.com{rec.uri.replace('.json','.wav')}"
+        import urllib.request
+        pw_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        pw_mgr.add_password(None, url, ACCOUNT_SID, AUTH_TOKEN)
+        handler = urllib.request.HTTPBasicAuthHandler(pw_mgr)
+        opener = urllib.request.build_opener(handler)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        tmp_wav = os.path.join(RECORDINGS_DIR, f"{ts}_{call_sid[:8]}.wav")
+        with opener.open(url) as r:
+            open(tmp_wav, 'wb').write(r.read())
+        print(f"💾 Downloaded Twilio recording: {tmp_wav}", flush=True)
+        transcribe_call(tmp_wav, meta)
+    except Exception as e:
+        print(f"❌ Recording fetch error: {e}", flush=True)
 
 # ─── CALL MONITOR (Live audio + recording + transcription) ───────────────────
 import audioop, wave, base64, datetime
@@ -348,7 +424,7 @@ def transcribe_call(wav_path, call_meta=None):
         oai = _openai.OpenAI(api_key=ev.get('OPENAI_API_KEY') or os.getenv('OPENAI_API_KEY'))
 
         with open(wav_path, 'rb') as f:
-            transcript = oai.audio.transcriptions.create(model='whisper-1', file=f, response_format='text')
+            transcript = oai.audio.transcriptions.create(model='gpt-4o-transcribe', file=f, response_format='text')
 
         if not transcript.strip():
             transcript = "[No speech detected]"
@@ -371,7 +447,7 @@ Return valid JSON only (no markdown):
 }}"""
 
         resp = oai.chat.completions.create(
-            model='gpt-4o-mini',
+            model='gpt-4o',
             messages=[{"role":"user","content":prompt}],
             response_format={"type":"json_object"}
         ).choices[0].message.content
@@ -385,7 +461,7 @@ Return valid JSON only (no markdown):
         os.makedirs(call_dir, exist_ok=True)
         os.rename(wav_path, os.path.join(call_dir, 'recording.wav'))
         open(os.path.join(call_dir, 'transcript.txt'), 'w').write(transcript)
-        open(os.path.join(call_dir, 'summary.txt'), 'w').write(summary)
+        open(os.path.join(call_dir, 'summary.txt'), 'w').write(summary if isinstance(summary, str) else '\n'.join(summary))
         open(os.path.join(call_dir, 'meta.json'), 'w').write(json.dumps(call_meta or {}, indent=2))
 
         print(f"✅ recordings/{folder_name}/", flush=True)
